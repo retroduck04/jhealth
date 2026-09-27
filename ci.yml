@@ -1,0 +1,127 @@
+# Builds and tests Janos Health on every push to main, then publishes the results
+# (installable .ipa, logs, screenshot) to the "ci-latest" pre-release on GitHub.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine-tests:
+    name: Engine tests (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install time-zone data
+        run: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tzdata
+      - name: Run engine tests
+        run: |
+          set -o pipefail
+          swift test --package-path Packages/JanosEngine 2>&1 | tee engine-tests.log
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-log
+          path: engine-tests.log
+          if-no-files-found: ignore
+
+  ios-build:
+    name: iOS build (macOS)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: xcodebuild -version | tee xcode-version.txt
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build for iPhone (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project JanosHealth.xcodeproj -scheme JanosHealth -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee ios-build.log
+      - name: Extract errors
+        if: always()
+        run: grep -E "error:|\*\* BUILD" ios-build.log > ios-errors.txt || true
+      - name: Package .ipa with HealthKit entitlement
+        run: |
+          APP=build/Build/Products/Release-iphoneos/JanosHealth.app
+          # Placeholder (ad-hoc) signature that carries the entitlements, so Sideloadly
+          # knows to request HealthKit when it re-signs with your Apple ID.
+          codesign --force --sign - --timestamp=none --entitlements Support/JanosHealth.entitlements "$APP"
+          codesign -d --entitlements - "$APP" > entitlements-check.txt 2>&1 || true
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry JanosHealth.ipa Payload
+          ls -la JanosHealth.ipa
+      - name: Simulator screenshot
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild -project JanosHealth.xcodeproj -scheme JanosHealth -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath simbuild \
+            CODE_SIGNING_ALLOWED=NO build > sim-build.log 2>&1
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for r,l in d.items() if 'iOS' in r for x in l if x['name'].startswith('iPhone')))")
+          xcrun simctl boot "$DEVICE"
+          xcrun simctl bootstatus "$DEVICE" -b
+          xcrun simctl install "$DEVICE" simbuild/Build/Products/Debug-iphonesimulator/JanosHealth.app
+          xcrun simctl launch "$DEVICE" com.perejanos.janoshealth
+          sleep 10
+          xcrun simctl io "$DEVICE" screenshot screenshot.png
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-output
+          path: |
+            JanosHealth.ipa
+            ios-build.log
+            ios-errors.txt
+            sim-build.log
+            screenshot.png
+            xcode-version.txt
+            entitlements-check.txt
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish ci-latest
+    needs: [engine-tests, ios-build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Write summary
+        run: |
+          mkdir -p out
+          {
+            echo "commit: ${{ github.sha }}"
+            echo "engine-tests: ${{ needs.engine-tests.result }}"
+            echo "ios-build: ${{ needs.ios-build.result }}"
+            date -u
+          } > out/summary.txt
+          ls -la out
+      - name: Replace the ci-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete ci-latest --yes --cleanup-tag || true
+          gh release create ci-latest out/* --prerelease --target "${{ github.sha }}" \
+            --title "Latest build" \
+            --notes "Automatic build of ${{ github.sha }}. Engine tests: ${{ needs.engine-tests.result }}. iOS build: ${{ needs.ios-build.result }}. Install JanosHealth.ipa with Sideloadly."
